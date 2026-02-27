@@ -204,7 +204,11 @@ function startRealtimeSync() {
     if (!S.isLocked) render();
   });
   var u2 = onSnapshot(collection(db, 'vault', 'folders'), function(snap) {
-    S.folders = snap.docs.map(function(d) { return d.data(); });
+    var incoming = snap.docs.map(function(d) { return d.data(); });
+    // Merge: keep any locally added folders not yet confirmed by Firestore
+    var incomingIds = incoming.map(function(f) { return String(f.id); });
+    var localOnly = S.folders.filter(function(f) { return incomingIds.indexOf(String(f.id)) === -1; });
+    S.folders = incoming.concat(localOnly);
     if (!S.isLocked) render();
   });
   S.unsub = function() { u1(); u2(); };
@@ -539,8 +543,8 @@ function attachListeners() {
 // ── Actions ───────────────────────────────────────────────────────
 async function doLogin() {
   if (!S.password.trim()){S.error='Please enter a password';render();return;}
-  if (!S.storedPassword){S.storedPassword=S.password;await saveSettings();S.isLocked=false;S.password='';S.error='';startRealtimeSync();render();}
-  else if (S.password===S.storedPassword){S.isLocked=false;S.password='';S.error='';startRealtimeSync();render();}
+  if (!S.storedPassword){S.storedPassword=S.password;await saveSettings();S.isLocked=false;S.password='';S.error='';if(!S.unsub)startRealtimeSync();render();}
+  else if (S.password===S.storedPassword){S.isLocked=false;S.password='';S.error='';if(!S.unsub)startRealtimeSync();render();}
   else{S.error='Incorrect password';S.password='';render();}
 }
 
@@ -553,7 +557,12 @@ async function doCreateFolder() {
   if(!S.newFolderName.trim()){S.error='Please enter a folder name';render();return;}
   var pid=S.currentPath.length?S.currentPath[S.currentPath.length-1].id:null;
   var folder={id:String(Date.now()),name:S.newFolderName.trim(),parentId:pid,created:new Date().toISOString()};
-  S.folders.push(folder);await saveFolder(folder);S.showModal=null;S.newFolderName='';flash('Folder created');
+  S.folders.push(folder);
+  S.showModal=null;
+  S.newFolderName='';
+  render();
+  await saveFolder(folder);
+  flash('Folder created');
 }
 
 async function doDelFolder(fid) {
@@ -600,8 +609,14 @@ function readDataURL(file){return new Promise(function(res){var r=new FileReader
 
 (async function(){
   showSync('syncing','Connecting...');
-  try{await loadSettings();showSync('synced','Connected!');}
-  catch(e){showSync('error','Connection failed');}
+  try{
+    await loadSettings();
+    showSync('synced','Connected!');
+    // Start listening immediately so phone sees changes without needing to re-login
+    startRealtimeSync();
+  } catch(e){
+    showSync('error','Connection failed');
+  }
   render();
 })();
 </script>
