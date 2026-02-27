@@ -35,7 +35,6 @@
     @keyframes slideIn { from{opacity:0;transform:translateY(-10px);} to{opacity:1;transform:translateY(0);} }
     .alert-error { background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
     .alert-success { background:#d1fae5; color:#065f46; border:1px solid #a7f3d0; }
-    .alert-info { background:#eff6ff; color:#1e40af; border:1px solid #bfdbfe; }
     .icon-btn { padding:.5rem; border:none; background:transparent; cursor:pointer; border-radius:.5rem; transition:all .2s; flex-shrink:0; }
     .icon-btn:hover { background:#f3f4f6; }
     .lock-screen { min-height:100vh; background:linear-gradient(135deg,#0f172a 0%,#581c87 50%,#0f172a 100%); display:flex; align-items:center; justify-content:center; padding:1rem; }
@@ -76,10 +75,12 @@
     .sync-badge { position:fixed; bottom:1rem; right:1rem; padding:.5rem 1rem; border-radius:2rem; font-size:.875rem; font-weight:600; box-shadow:0 4px 6px rgba(0,0,0,.1); z-index:100; display:flex; align-items:center; gap:.4rem; }
     .sync-badge.synced { background:#10b981; color:white; }
     .sync-badge.syncing { background:#f59e0b; color:white; }
-    .sync-badge.offline { background:#ef4444; color:white; }
+    .sync-badge.error { background:#ef4444; color:white; }
     .sync-badge.hidden { display:none !important; }
-    .spinner { width:14px; height:14px; border:2px solid rgba(255,255,255,.4); border-top-color:white; border-radius:50%; animation:spin .7s linear infinite; }
+    .spinner { width:14px; height:14px; border:2px solid rgba(255,255,255,.4); border-top-color:white; border-radius:50%; animation:spin .7s linear infinite; display:inline-block; flex-shrink:0; }
     @keyframes spin { to { transform:rotate(360deg); } }
+    .progress-bar { height:6px; background:#e5e7eb; border-radius:3px; margin-top:.4rem; overflow:hidden; }
+    .progress-fill { height:100%; background:#7c3aed; border-radius:3px; transition:width .3s; }
     .flex { display:flex; }
     .gap-1 { gap:.5rem; }
     .mt-1 { margin-top:.5rem; }
@@ -95,46 +96,34 @@
 <body>
 <div id="app"></div>
 <div id="syncBadge" class="sync-badge hidden"></div>
-
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
-import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, getDocs, deleteDoc, writeBatch } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, deleteDoc, writeBatch } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
-// ── Firebase config ──────────────────────────────────────────────
 const firebaseConfig = {
   apiKey: "AIzaSyDtMFDyXQDpoOXP7h5sJaHbpImp7bjHsGU",
   authDomain: "file-locker-f33cf.firebaseapp.com",
   projectId: "file-locker-f33cf",
   storageBucket: "file-locker-f33cf.firebasestorage.app",
   messagingSenderId: "466952723914",
-  appId: "1:466952723914:web:9643bbc75922d1ba0c4333",
-  measurementId: "G-9JMNDHLQHH"
+  appId: "1:466952723914:web:9643bbc75922d1ba0c4333"
 };
 
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
 
-// ── App State ─────────────────────────────────────────────────────
+// Each chunk ~700KB of base64 — safely under Firestore's 1MB doc limit
+const CHUNK_SIZE = 700 * 1024;
+
 var S = {
-  isLocked: true,
-  password: '',
-  storedPassword: '',
-  files: [],
-  folders: [],
-  currentPath: [],
-  showPassword: false,
-  error: '',
-  success: '',
-  uploading: false,
-  showModal: null,
-  newFolderName: '',
-  pvFile: null,
-  pvIndex: -1,
-  showHidden: false,
-  secretPassword: '',
-  secretError: '',
-  syncing: false,
-  syncUnsubscribe: null
+  isLocked: true, password: '', storedPassword: '',
+  files: [], folders: [], currentPath: [],
+  showPassword: false, error: '', success: '',
+  uploading: false, uploadProgress: 0,
+  showModal: null, newFolderName: '',
+  pvFile: null, pvIndex: -1,
+  showHidden: false, secretPassword: '', secretError: '',
+  unsub: null
 };
 
 // ── Sync badge ────────────────────────────────────────────────────
@@ -143,119 +132,89 @@ function showSync(state, msg) {
   if (!b) return;
   b.className = 'sync-badge ' + state;
   b.innerHTML = (state === 'syncing' ? '<div class="spinner"></div>' : '☁️') + ' ' + msg;
-  if (state === 'synced') {
-    setTimeout(function() { b.classList.add('hidden'); }, 3000);
+  if (state === 'synced') setTimeout(function() { b.classList.add('hidden'); }, 2500);
+}
+
+// ── Firestore ─────────────────────────────────────────────────────
+async function loadSettings() {
+  var snap = await getDoc(doc(db, 'vault', 'settings'));
+  if (snap.exists()) {
+    S.storedPassword = snap.data().password || '';
+    S.secretPassword = snap.data().secretPassword || '';
   }
 }
 
-// ── Firestore helpers ─────────────────────────────────────────────
-async function loadSettings() {
-  try {
-    var snap = await getDoc(doc(db, 'vault', 'settings'));
-    if (snap.exists()) {
-      var d = snap.data();
-      S.storedPassword = d.password || '';
-      S.secretPassword = d.secretPassword || '';
-    }
-  } catch(e) { console.warn('loadSettings error', e); }
-}
-
 async function saveSettings() {
-  try {
-    await setDoc(doc(db, 'vault', 'settings'), {
-      password: S.storedPassword,
-      secretPassword: S.secretPassword
-    });
-  } catch(e) { console.warn('saveSettings error', e); }
+  await setDoc(doc(db, 'vault', 'settings'), { password: S.storedPassword, secretPassword: S.secretPassword });
 }
 
-async function loadFilesAndFolders() {
-  try {
-    var [fSnap, folSnap] = await Promise.all([
-      getDocs(collection(db, 'vault', 'data', 'files')),
-      getDocs(collection(db, 'vault', 'data', 'folders'))
-    ]);
-    S.files   = fSnap.docs.map(function(d) { return d.data(); });
-    S.folders = folSnap.docs.map(function(d) { return d.data(); });
-  } catch(e) { console.warn('loadFilesAndFolders error', e); }
+async function saveMeta(file) {
+  var meta = { id: file.id, name: file.name, size: file.size, type: file.type, date: file.date, folderId: file.folderId, hidden: file.hidden, chunks: file.chunks || 0 };
+  await setDoc(doc(db, 'vault', 'files', String(file.id)), meta);
 }
 
-async function saveFile(file) {
-  showSync('syncing', 'Syncing...');
-  try {
-    await setDoc(doc(db, 'vault', 'data', 'files', String(file.id)), file);
-    showSync('synced', 'Synced!');
-  } catch(e) { showSync('offline', 'Sync failed'); }
+async function saveFileChunked(file, dataUrl) {
+  var total = Math.ceil(dataUrl.length / CHUNK_SIZE);
+  for (var c = 0; c < total; c++) {
+    var chunk = dataUrl.slice(c * CHUNK_SIZE, (c + 1) * CHUNK_SIZE);
+    await setDoc(doc(db, 'vault', 'chunks', file.id + '_' + c), { data: chunk, index: c });
+    S.uploadProgress = Math.round(((c + 1) / total) * 100);
+    showSync('syncing', 'Uploading ' + (c+1) + '/' + total + ' parts...');
+    render();
+  }
+  file.chunks = total;
+  await saveMeta(file);
+  showSync('synced', 'Synced!');
 }
 
-async function deleteFile(id) {
-  showSync('syncing', 'Syncing...');
-  try {
-    await deleteDoc(doc(db, 'vault', 'data', 'files', String(id)));
-    showSync('synced', 'Synced!');
-  } catch(e) { showSync('offline', 'Sync failed'); }
+async function loadFileData(fileId, numChunks) {
+  var parts = [];
+  for (var c = 0; c < numChunks; c++) {
+    var snap = await getDoc(doc(db, 'vault', 'chunks', fileId + '_' + c));
+    if (snap.exists()) parts.push(snap.data().data);
+  }
+  return parts.join('');
+}
+
+async function deleteFileFromDB(file) {
+  var batch = writeBatch(db);
+  for (var c = 0; c < (file.chunks || 0); c++) {
+    batch.delete(doc(db, 'vault', 'chunks', file.id + '_' + c));
+  }
+  batch.delete(doc(db, 'vault', 'files', String(file.id)));
+  await batch.commit();
 }
 
 async function saveFolder(folder) {
-  showSync('syncing', 'Syncing...');
-  try {
-    await setDoc(doc(db, 'vault', 'data', 'folders', String(folder.id)), folder);
-    showSync('synced', 'Synced!');
-  } catch(e) { showSync('offline', 'Sync failed'); }
+  await setDoc(doc(db, 'vault', 'folders', String(folder.id)), folder);
+}
+async function deleteFolderFromDB(id) {
+  await deleteDoc(doc(db, 'vault', 'folders', String(id)));
 }
 
-async function deleteFolder(id) {
-  try { await deleteDoc(doc(db, 'vault', 'data', 'folders', String(id))); } catch(e) {}
-}
-
-async function saveAllFiles() {
-  showSync('syncing', 'Syncing...');
-  try {
-    var batch = writeBatch(db);
-    // clear existing
-    var snap = await getDocs(collection(db, 'vault', 'data', 'files'));
-    snap.docs.forEach(function(d) { batch.delete(d.ref); });
-    S.files.forEach(function(f) {
-      batch.set(doc(db, 'vault', 'data', 'files', String(f.id)), f);
-    });
-    await batch.commit();
-    showSync('synced', 'Synced!');
-  } catch(e) { showSync('offline', 'Sync failed'); }
-}
-
-async function saveAllFolders() {
-  showSync('syncing', 'Syncing...');
-  try {
-    var batch = writeBatch(db);
-    var snap = await getDocs(collection(db, 'vault', 'data', 'folders'));
-    snap.docs.forEach(function(d) { batch.delete(d.ref); });
-    S.folders.forEach(function(f) {
-      batch.set(doc(db, 'vault', 'data', 'folders', String(f.id)), f);
-    });
-    await batch.commit();
-    showSync('synced', 'Synced!');
-  } catch(e) { showSync('offline', 'Sync failed'); }
-}
-
-// Real-time listener — updates UI when another device changes data
 function startRealtimeSync() {
-  if (S.syncUnsubscribe) S.syncUnsubscribe();
-  S.syncUnsubscribe = onSnapshot(collection(db, 'vault', 'data', 'files'), function(snap) {
-    S.files = snap.docs.map(function(d) { return d.data(); });
+  if (S.unsub) S.unsub();
+  var u1 = onSnapshot(collection(db, 'vault', 'files'), function(snap) {
+    var incoming = snap.docs.map(function(d) { return d.data(); });
+    // Preserve locally loaded dataUrl
+    S.files = incoming.map(function(meta) {
+      var existing = S.files.find(function(f) { return String(f.id) === String(meta.id); });
+      return existing ? Object.assign({}, meta, { dataUrl: existing.dataUrl }) : meta;
+    });
     if (!S.isLocked) render();
   });
-  onSnapshot(collection(db, 'vault', 'data', 'folders'), function(snap) {
+  var u2 = onSnapshot(collection(db, 'vault', 'folders'), function(snap) {
     S.folders = snap.docs.map(function(d) { return d.data(); });
     if (!S.isLocked) render();
   });
+  S.unsub = function() { u1(); u2(); };
 }
 
-// ── File type helpers ─────────────────────────────────────────────
+// ── File helpers ──────────────────────────────────────────────────
 function isGif(file) {
   if ((file.name || '').toLowerCase().endsWith('.gif')) return true;
   return file.type === 'image/gif';
 }
-
 function fileCat(file) {
   if (isGif(file)) return 'image';
   var t = file.type || '';
@@ -269,14 +228,10 @@ function fileCat(file) {
   if (['mp4','mov','avi','mkv','webm'].indexOf(ext) >= 0) return 'video';
   if (['mp3','wav','ogg','m4a','flac'].indexOf(ext) >= 0) return 'audio';
   if (ext === 'pdf') return 'pdf';
-  if (['txt','md','js','ts','json','html','css','csv','xml','yaml','yml'].indexOf(ext) >= 0) return 'text';
+  if (['txt','md','js','ts','json','html','css','csv','xml'].indexOf(ext) >= 0) return 'text';
   return 'other';
 }
-
-function fileExt(name) {
-  var p = (name || '').split('.');
-  return p.length > 1 ? p.pop().toLowerCase() : '';
-}
+function fileExt(name) { var p=(name||'').split('.'); return p.length>1?p.pop().toLowerCase():''; }
 
 var ICONS = {
   image: '<svg width="32" height="32" fill="none" stroke="#10b981" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" stroke-width="2"/><circle cx="8.5" cy="8.5" r="1.5" stroke-width="2"/><path d="M21 15l-5-5L5 21" stroke-width="2"/></svg>',
@@ -286,95 +241,95 @@ var ICONS = {
   text:  '<svg width="32" height="32" fill="none" stroke="#0ea5e9" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke-width="2"/><path d="M14 2v6h6M9 13h6M9 17h4" stroke-width="2"/></svg>',
   other: '<svg width="32" height="32" fill="none" stroke="#6b7280" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" stroke-width="2"/><path d="M13 2v7h7" stroke-width="2"/></svg>'
 };
-
 var BGCOL  = { image:'#ecfdf5', video:'#ede9fe', audio:'#fdf2f8', pdf:'#fef2f2', text:'#eff6ff', other:'#f3f4f6' };
 var LABELS = { image:'Photo', video:'Video', audio:'Audio', pdf:'PDF', text:'Text', other:'File' };
 
 function thumbHtml(file) {
-  var c = fileCat(file);
-  var e = fileExt(file.name) || c;
-  var badge = '<span class="file-badge">' + e + '</span>';
-  if (c === 'image') {
-    var cls = isGif(file) ? 'gif-thumb' : '';
-    return '<div class="thumb-wrap"><img src="' + file.data + '" class="' + cls + '" alt="">' + badge + '</div>';
+  var c = fileCat(file), e = fileExt(file.name)||c;
+  var badge = '<span class="file-badge">'+e+'</span>';
+  if (c==='image' && file.dataUrl) {
+    var cls = isGif(file)?'gif-thumb':'';
+    return '<div class="thumb-wrap"><img src="'+file.dataUrl+'" class="'+cls+'" alt="">'+badge+'</div>';
   }
-  return '<div class="thumb-wrap"><div class="thumb-box" style="background:' + BGCOL[c] + '">' + ICONS[c] + '</div>' + badge + '</div>';
+  return '<div class="thumb-wrap"><div class="thumb-box" style="background:'+BGCOL[c]+'">'+ICONS[c]+'</div>'+badge+'</div>';
 }
 
 // ── Preview ───────────────────────────────────────────────────────
 function folderFiles() {
-  var fid = S.currentPath.length ? S.currentPath[S.currentPath.length - 1].id : null;
-  return S.files.filter(function(f) { return f.folderId === fid && (!f.hidden || S.showHidden); });
+  var fid = S.currentPath.length ? S.currentPath[S.currentPath.length-1].id : null;
+  return S.files.filter(function(f) { return f.folderId===fid && (!f.hidden||S.showHidden); });
 }
 
-function openPreview(fileId) {
+async function openPreview(fileId) {
   var all = folderFiles();
-  var idx = all.findIndex(function(f) { return String(f.id) === String(fileId); });
-  if (idx < 0) return;
-  S.pvFile = all[idx]; S.pvIndex = idx; drawPv();
+  var idx = all.findIndex(function(f) { return String(f.id)===String(fileId); });
+  if (idx<0) return;
+  var file = all[idx];
+  if (!file.dataUrl && file.chunks>0) {
+    showSync('syncing', 'Loading file...');
+    file.dataUrl = await loadFileData(file.id, file.chunks);
+    showSync('synced', 'Loaded!');
+  }
+  S.pvFile=file; S.pvIndex=idx; drawPv();
 }
 
 function closePv() {
-  S.pvFile = null; S.pvIndex = -1;
-  var el = document.getElementById('pv');
-  if (el) el.remove();
+  S.pvFile=null; S.pvIndex=-1;
+  var el=document.getElementById('pv'); if(el) el.remove();
   document.removeEventListener('keydown', pvKey);
 }
 
-function navPv(d) {
-  var all = folderFiles();
-  var ni = S.pvIndex + d;
-  if (ni < 0 || ni >= all.length) return;
-  S.pvIndex = ni; S.pvFile = all[ni]; drawPv();
+async function navPv(d) {
+  var all=folderFiles(), ni=S.pvIndex+d;
+  if (ni<0||ni>=all.length) return;
+  S.pvIndex=ni; S.pvFile=all[ni];
+  if (!S.pvFile.dataUrl && S.pvFile.chunks>0) {
+    showSync('syncing','Loading...'); 
+    S.pvFile.dataUrl=await loadFileData(S.pvFile.id,S.pvFile.chunks); 
+    showSync('synced','Loaded!');
+  }
+  drawPv();
 }
 
 function pvKey(e) {
-  if (e.key === 'Escape') closePv();
-  if (e.key === 'ArrowLeft') navPv(-1);
-  if (e.key === 'ArrowRight') navPv(1);
+  if (e.key==='Escape') closePv();
+  if (e.key==='ArrowLeft') navPv(-1);
+  if (e.key==='ArrowRight') navPv(1);
 }
 
 function pvBody(file) {
-  var c = fileCat(file);
-  if (c === 'image') return '<img src="' + file.data + '" alt="' + esc(file.name) + '">';
-  if (c === 'video') return '<video controls autoplay playsinline><source src="' + file.data + '" type="' + esc(file.type) + '">Cannot play video.</video>';
-  if (c === 'audio') return '<div class="audio-card">' + ICONS.audio + '<p>' + esc(file.name) + '</p><audio controls autoplay style="width:100%"><source src="' + file.data + '" type="' + esc(file.type) + '"></audio></div>';
-  if (c === 'pdf') return '<iframe src="' + file.data + '" title="' + esc(file.name) + '"></iframe>';
-  if (c === 'text') {
-    var txt = '';
-    try { txt = decodeURIComponent(escape(atob((file.data || '').split(',')[1] || ''))); } catch(e) { txt = '(Cannot decode)'; }
-    return '<pre>' + txt.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>';
-  }
-  return '<div class="no-preview-card">' + ICONS.other + '<p style="color:white;font-weight:600;font-size:1rem;margin:.75rem 0;">' + esc(file.name) + '</p><p>No preview for .' + fileExt(file.name) + ' files</p><br><button class="pv-topbtn" id="pv-dl2">Download</button></div>';
+  var c=fileCat(file), src=file.dataUrl||'';
+  if (!src) return '<div class="no-preview-card"><div class="spinner" style="margin:0 auto 1rem;width:32px;height:32px;border-width:3px;"></div><p style="color:white;">Loading...</p></div>';
+  if (c==='image') return '<img src="'+src+'" alt="'+esc(file.name)+'">';
+  if (c==='video') return '<video controls autoplay playsinline><source src="'+src+'" type="'+esc(file.type)+'">Cannot play video.</video>';
+  if (c==='audio') return '<div class="audio-card">'+ICONS.audio+'<p>'+esc(file.name)+'</p><audio controls autoplay style="width:100%"><source src="'+src+'" type="'+esc(file.type)+'"></audio></div>';
+  if (c==='pdf') return '<iframe src="'+src+'" title="'+esc(file.name)+'"></iframe>';
+  if (c==='text') { var txt=''; try { txt=decodeURIComponent(escape(atob(src.split(',')[1]||''))); } catch(e){txt='(Cannot decode)';} return '<pre>'+txt.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre>'; }
+  return '<div class="no-preview-card">'+ICONS.other+'<p style="color:white;font-weight:600;font-size:1rem;margin:.75rem 0;">'+esc(file.name)+'</p><p>No preview for .'+fileExt(file.name)+' files</p><br><button class="pv-topbtn" id="pv-dl2">Download</button></div>';
 }
 
 function drawPv() {
-  var old = document.getElementById('pv');
-  if (old) old.remove();
-  document.removeEventListener('keydown', pvKey);
+  var old=document.getElementById('pv'); if(old) old.remove();
+  document.removeEventListener('keydown',pvKey);
   if (!S.pvFile) return;
-  var file = S.pvFile, all = folderFiles(), total = all.length, idx = S.pvIndex, gif = isGif(file);
-  var el = document.createElement('div');
-  el.id = 'pv'; el.className = 'pv-overlay';
-  el.innerHTML =
-    '<div class="pv-topbar"><span class="pv-name">' + esc(file.name) + '</span>'
-    + '<div class="pv-actions">'
-    + (gif ? '<span class="gif-tag">GIF</span>' : '')
-    + '<span class="pv-counter">' + (idx+1) + ' / ' + total + '</span>'
-    + '<button class="pv-topbtn" id="pv-dl">Download</button>'
-    + '<button class="pv-close" id="pv-x">&#x2715;</button>'
-    + '</div></div>'
-    + '<button class="pv-arrow pv-prev" id="pv-prev" ' + (idx===0?'disabled':'') + '>&#8249;</button>'
-    + '<div class="pv-body">' + pvBody(file) + '</div>'
-    + '<button class="pv-arrow pv-next" id="pv-next" ' + (idx>=total-1?'disabled':'') + '>&#8250;</button>';
+  var file=S.pvFile, all=folderFiles(), total=all.length, idx=S.pvIndex, gif=isGif(file);
+  var el=document.createElement('div'); el.id='pv'; el.className='pv-overlay';
+  el.innerHTML='<div class="pv-topbar"><span class="pv-name">'+esc(file.name)+'</span>'
+    +'<div class="pv-actions">'+(gif?'<span class="gif-tag">GIF</span>':'')
+    +'<span class="pv-counter">'+(idx+1)+' / '+total+'</span>'
+    +'<button class="pv-topbtn" id="pv-dl">Download</button>'
+    +'<button class="pv-close" id="pv-x">&#x2715;</button>'
+    +'</div></div>'
+    +'<button class="pv-arrow pv-prev" id="pv-prev" '+(idx===0?'disabled':'')+'>&#8249;</button>'
+    +'<div class="pv-body">'+pvBody(file)+'</div>'
+    +'<button class="pv-arrow pv-next" id="pv-next" '+(idx>=total-1?'disabled':'')+'>&#8250;</button>';
   document.body.appendChild(el);
-  document.getElementById('pv-x').onclick = closePv;
-  document.getElementById('pv-dl').onclick = function() { dlFile(file); };
-  document.getElementById('pv-prev').onclick = function() { navPv(-1); };
-  document.getElementById('pv-next').onclick = function() { navPv(1); };
-  var dl2 = document.getElementById('pv-dl2');
-  if (dl2) dl2.onclick = function() { dlFile(file); };
-  document.addEventListener('keydown', pvKey);
+  document.getElementById('pv-x').onclick=closePv;
+  document.getElementById('pv-dl').onclick=function(){dlFile(file);};
+  document.getElementById('pv-prev').onclick=function(){navPv(-1);};
+  document.getElementById('pv-next').onclick=function(){navPv(1);};
+  var dl2=document.getElementById('pv-dl2'); if(dl2) dl2.onclick=function(){dlFile(file);};
+  document.addEventListener('keydown',pvKey);
 }
 
 // ── Render ────────────────────────────────────────────────────────
@@ -385,421 +340,268 @@ function render() {
 
 function renderLock() {
   return '<div class="lock-screen"><div class="card" style="max-width:400px;width:100%;">'
-    + '<div class="text-center mb-2"><div style="display:inline-block;background:#f3e8ff;padding:1rem;border-radius:50%;">'
-    + '<svg width="48" height="48" fill="none" stroke="#7c3aed" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke-width="2"/></svg>'
-    + '</div></div>'
-    + '<h1 style="font-size:2rem;font-weight:bold;text-align:center;margin-bottom:.5rem;">File Locker</h1>'
-    + '<div style="display:flex;align-items:center;justify-content:center;gap:.4rem;margin-bottom:1rem;">'
-    + '<span style="background:#d1fae5;color:#065f46;font-size:.75rem;font-weight:600;padding:3px 10px;border-radius:2rem;">☁️ Cloud Sync ON</span>'
-    + '</div>'
-    + '<p class="text-center text-gray mb-2">' + (S.storedPassword ? 'Enter your password to unlock' : 'Create a password to get started') + '</p>'
-    + (S.error ? '<div class="alert alert-error">' + esc(S.error) + '</div>' : '')
-    + '<div style="position:relative;margin-bottom:1rem;">'
-    + '<input type="' + (S.showPassword ? 'text' : 'password') + '" class="input" placeholder="Password" id="pwInput" value="' + esc(S.password) + '" autocomplete="current-password">'
-    + '<button class="icon-btn" id="togglePw" style="position:absolute;right:8px;top:8px;">'
-    + (S.showPassword
-        ? '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22" stroke-width="2"/></svg>'
-        : '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke-width="2"/><circle cx="12" cy="12" r="3" stroke-width="2"/></svg>')
-    + '</button></div>'
-    + '<button class="btn btn-primary" style="width:100%;" id="loginBtn">' + (S.storedPassword ? 'Unlock' : 'Set Password &amp; Unlock') + '</button>'
-    + '</div></div>';
+    +'<div class="text-center mb-2"><div style="display:inline-block;background:#f3e8ff;padding:1rem;border-radius:50%;">'
+    +'<svg width="48" height="48" fill="none" stroke="#7c3aed" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke-width="2"/></svg>'
+    +'</div></div>'
+    +'<h1 style="font-size:2rem;font-weight:bold;text-align:center;margin-bottom:.5rem;">File Locker</h1>'
+    +'<div style="text-align:center;margin-bottom:1rem;"><span style="background:#d1fae5;color:#065f46;font-size:.75rem;font-weight:600;padding:3px 10px;border-radius:2rem;">☁️ Cloud Sync ON</span></div>'
+    +'<p class="text-center text-gray mb-2">'+(S.storedPassword?'Enter your password to unlock':'Create a password to get started')+'</p>'
+    +(S.error?'<div class="alert alert-error">'+esc(S.error)+'</div>':'')
+    +'<div style="position:relative;margin-bottom:1rem;">'
+    +'<input type="'+(S.showPassword?'text':'password')+'" class="input" placeholder="Password" id="pwInput" value="'+esc(S.password)+'" autocomplete="current-password">'
+    +'<button class="icon-btn" id="togglePw" style="position:absolute;right:8px;top:8px;">'
+    +(S.showPassword
+      ?'<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22" stroke-width="2"/></svg>'
+      :'<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke-width="2"/><circle cx="12" cy="12" r="3" stroke-width="2"/></svg>')
+    +'</button></div>'
+    +'<button class="btn btn-primary" style="width:100%;" id="loginBtn">'+(S.storedPassword?'Unlock':'Set Password &amp; Unlock')+'</button>'
+    +'</div></div>';
 }
 
 function renderSecretModal() {
-  var isNew = !S.secretPassword;
-  if (S.showModal === 'changeSecret') {
+  var isNew=!S.secretPassword;
+  if (S.showModal==='changeSecret') {
     return '<div class="modal"><div class="modal-box-dark">'
-      + '<h2 style="font-size:1.2rem;font-weight:bold;margin-bottom:1.25rem;text-align:center;">Change Secret Password</h2>'
-      + (S.secretError ? '<div class="secret-err">' + esc(S.secretError) + '</div>' : '')
-      + '<input type="password" class="input mb-1" placeholder="Current secret password" id="oldSecretInput">'
-      + '<input type="password" class="input mb-1" placeholder="New secret password" id="newSecretInput">'
-      + '<input type="password" class="input mb-2" placeholder="Confirm new password" id="confirmSecretInput">'
-      + '<div class="flex gap-1">'
-      + '<button class="btn btn-pink" style="flex:1;" id="confirmChangeBtn">Update Password</button>'
-      + '<button class="btn" style="flex:1;background:rgba(255,255,255,.15);color:white;" id="cancelSecretBtn">Cancel</button>'
-      + '</div></div></div>';
+      +'<h2 style="font-size:1.2rem;font-weight:bold;margin-bottom:1.25rem;text-align:center;">Change Secret Password</h2>'
+      +(S.secretError?'<div class="secret-err">'+esc(S.secretError)+'</div>':'')
+      +'<input type="password" class="input mb-1" placeholder="Current secret password" id="oldSecretInput">'
+      +'<input type="password" class="input mb-1" placeholder="New secret password" id="newSecretInput">'
+      +'<input type="password" class="input mb-2" placeholder="Confirm new password" id="confirmSecretInput">'
+      +'<div class="flex gap-1"><button class="btn btn-pink" style="flex:1;" id="confirmChangeBtn">Update Password</button>'
+      +'<button class="btn" style="flex:1;background:rgba(255,255,255,.15);color:white;" id="cancelSecretBtn">Cancel</button></div></div></div>';
   }
   if (isNew) {
     return '<div class="modal"><div class="modal-box-dark">'
-      + '<div style="text-align:center;margin-bottom:1.5rem;">'
-      + '<div style="display:inline-block;background:rgba(255,255,255,.1);padding:1rem;border-radius:50%;margin-bottom:.75rem;">'
-      + '<svg width="40" height="40" fill="none" stroke="#a78bfa" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke-width="2"/></svg></div>'
-      + '<h2 style="font-size:1.3rem;font-weight:bold;margin-bottom:.4rem;">Create Secret Vault</h2>'
-      + '<p style="color:rgba(255,255,255,.65);font-size:.9rem;">Set a password to protect your hidden files.</p>'
-      + '</div>'
-      + (S.secretError ? '<div class="secret-err">' + esc(S.secretError) + '</div>' : '')
-      + '<input type="password" class="input mb-1" placeholder="New secret password" id="secretPwA" autocomplete="new-password">'
-      + '<input type="password" class="input mb-2" placeholder="Confirm secret password" id="secretPwB" autocomplete="new-password">'
-      + '<div class="flex gap-1">'
-      + '<button class="btn btn-pink" style="flex:1;" id="setSecretBtn">Create Vault</button>'
-      + '<button class="btn" style="flex:1;background:rgba(255,255,255,.15);color:white;" id="cancelSecretBtn">Cancel</button>'
-      + '</div></div></div>';
+      +'<div style="text-align:center;margin-bottom:1.5rem;"><div style="display:inline-block;background:rgba(255,255,255,.1);padding:1rem;border-radius:50%;margin-bottom:.75rem;">'
+      +'<svg width="40" height="40" fill="none" stroke="#a78bfa" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke-width="2"/></svg></div>'
+      +'<h2 style="font-size:1.3rem;font-weight:bold;margin-bottom:.4rem;">Create Secret Vault</h2>'
+      +'<p style="color:rgba(255,255,255,.65);font-size:.9rem;">Set a password to protect your hidden files.</p></div>'
+      +(S.secretError?'<div class="secret-err">'+esc(S.secretError)+'</div>':'')
+      +'<input type="password" class="input mb-1" placeholder="New secret password" id="secretPwA" autocomplete="new-password">'
+      +'<input type="password" class="input mb-2" placeholder="Confirm secret password" id="secretPwB" autocomplete="new-password">'
+      +'<div class="flex gap-1"><button class="btn btn-pink" style="flex:1;" id="setSecretBtn">Create Vault</button>'
+      +'<button class="btn" style="flex:1;background:rgba(255,255,255,.15);color:white;" id="cancelSecretBtn">Cancel</button></div></div></div>';
   }
   return '<div class="modal"><div class="modal-box-dark">'
-    + '<div style="text-align:center;margin-bottom:1.5rem;">'
-    + '<div style="display:inline-block;background:rgba(255,255,255,.1);padding:1rem;border-radius:50%;margin-bottom:.75rem;">'
-    + '<svg width="40" height="40" fill="none" stroke="#a78bfa" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke-width="2"/><circle cx="12" cy="12" r="3" stroke-width="2"/></svg></div>'
-    + '<h2 style="font-size:1.3rem;font-weight:bold;margin-bottom:.4rem;">Secret Vault</h2>'
-    + '<p style="color:rgba(255,255,255,.65);font-size:.9rem;">Enter your secret password to reveal hidden files.</p>'
-    + '</div>'
-    + (S.secretError ? '<div class="secret-err">' + esc(S.secretError) + '</div>' : '')
-    + '<input type="password" class="input mb-2" placeholder="Secret password" id="secretPwA" autocomplete="current-password">'
-    + '<div class="flex gap-1">'
-    + '<button class="btn btn-pink" style="flex:1;" id="unlockSecretBtn">Reveal Files</button>'
-    + '<button class="btn" style="flex:1;background:rgba(255,255,255,.15);color:white;" id="cancelSecretBtn">Cancel</button>'
-    + '</div>'
-    + '<button id="changeSecretLinkBtn" style="background:none;border:none;color:rgba(255,255,255,.4);font-size:.8rem;cursor:pointer;margin-top:1rem;width:100%;text-align:center;">Change secret password</button>'
-    + '</div></div>';
+    +'<div style="text-align:center;margin-bottom:1.5rem;"><div style="display:inline-block;background:rgba(255,255,255,.1);padding:1rem;border-radius:50%;margin-bottom:.75rem;">'
+    +'<svg width="40" height="40" fill="none" stroke="#a78bfa" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke-width="2"/><circle cx="12" cy="12" r="3" stroke-width="2"/></svg></div>'
+    +'<h2 style="font-size:1.3rem;font-weight:bold;margin-bottom:.4rem;">Secret Vault</h2>'
+    +'<p style="color:rgba(255,255,255,.65);font-size:.9rem;">Enter your secret password to reveal hidden files.</p></div>'
+    +(S.secretError?'<div class="secret-err">'+esc(S.secretError)+'</div>':'')
+    +'<input type="password" class="input mb-2" placeholder="Secret password" id="secretPwA" autocomplete="current-password">'
+    +'<div class="flex gap-1"><button class="btn btn-pink" style="flex:1;" id="unlockSecretBtn">Reveal Files</button>'
+    +'<button class="btn" style="flex:1;background:rgba(255,255,255,.15);color:white;" id="cancelSecretBtn">Cancel</button></div>'
+    +'<button id="changeSecretLinkBtn" style="background:none;border:none;color:rgba(255,255,255,.4);font-size:.8rem;cursor:pointer;margin-top:1rem;width:100%;text-align:center;">Change secret password</button>'
+    +'</div></div>';
 }
 
 function renderMain() {
-  var fid = S.currentPath.length ? S.currentPath[S.currentPath.length - 1].id : null;
-  var allFolderFiles = S.files.filter(function(f) { return f.folderId === fid; });
-  var cFiles   = allFolderFiles.filter(function(f) { return !f.hidden || S.showHidden; });
-  var hiddenN  = allFolderFiles.filter(function(f) { return f.hidden; }).length;
-  var cFolders = S.folders.filter(function(f) { return f.parentId === fid; });
+  var fid=S.currentPath.length?S.currentPath[S.currentPath.length-1].id:null;
+  var allFF=S.files.filter(function(f){return f.folderId===fid;});
+  var cFiles=allFF.filter(function(f){return !f.hidden||S.showHidden;});
+  var hiddenN=allFF.filter(function(f){return f.hidden;}).length;
+  var cFolders=S.folders.filter(function(f){return f.parentId===fid;});
 
-  var crumb = '<span class="bc-item" data-idx="-1">'
-    + '<svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin-right:4px;"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" stroke-width="2"/></svg>Home</span>'
-    + S.currentPath.map(function(f,i) {
-        return '<span style="color:#9ca3af;">&rsaquo;</span><span class="bc-item" data-idx="' + i + '">' + esc(f.name) + '</span>';
-      }).join('');
+  var crumb='<span class="bc-item" data-idx="-1"><svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin-right:4px;"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" stroke-width="2"/></svg>Home</span>'
+    +S.currentPath.map(function(f,i){return '<span style="color:#9ca3af;">&rsaquo;</span><span class="bc-item" data-idx="'+i+'">'+esc(f.name)+'</span>';}).join('');
 
-  var folderRows = cFolders.map(function(f) {
-    return '<div class="folder-item" data-fid="' + f.id + '">'
-      + '<svg width="48" height="48" fill="none" stroke="#3b82f6" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" stroke-width="2"/></svg>'
-      + '<div style="flex:1;min-width:0;"><div style="font-weight:600;color:#1f2937;">' + esc(f.name) + '</div>'
-      + '<div class="text-sm text-gray">' + fCount(f.id) + ' items</div></div>'
-      + '<button class="icon-btn del-folder" data-id="' + f.id + '" title="Delete folder" style="color:#ef4444;">'
-      + '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" stroke-width="2"/></svg>'
-      + '</button></div>';
+  var folderRows=cFolders.map(function(f){
+    return '<div class="folder-item" data-fid="'+f.id+'">'
+      +'<svg width="48" height="48" fill="none" stroke="#3b82f6" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" stroke-width="2"/></svg>'
+      +'<div style="flex:1;min-width:0;"><div style="font-weight:600;color:#1f2937;">'+esc(f.name)+'</div>'
+      +'<div class="text-sm text-gray">'+fCount(f.id)+' items</div></div>'
+      +'<button class="icon-btn del-folder" data-id="'+f.id+'" style="color:#ef4444;">'
+      +'<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" stroke-width="2"/></svg>'
+      +'</button></div>';
   }).join('');
 
-  var eyeOpen = '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke-width="2"/><circle cx="12" cy="12" r="3" stroke-width="2"/></svg>';
-  var eyeOff  = '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22" stroke-width="2"/></svg>';
-  var trashSvg = '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" stroke-width="2"/></svg>';
-  var dlSvg    = '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" stroke-width="2"/></svg>';
+  var eyeOn='<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke-width="2"/><circle cx="12" cy="12" r="3" stroke-width="2"/></svg>';
+  var eyeOff='<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22" stroke-width="2"/></svg>';
+  var trash='<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" stroke-width="2"/></svg>';
+  var dl='<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" stroke-width="2"/></svg>';
 
-  var fileRows = cFiles.map(function(f) {
-    var isRevealed = f.hidden && S.showHidden;
-    var blur = isRevealed ? 'filter:blur(6px);pointer-events:none;user-select:none;' : '';
-    var rowStyle = isRevealed ? 'opacity:.65;border-color:#f9a8d4;background:#fff1f2;' : '';
-    var gif = isGif(f);
-    var label = f.hidden ? 'Hidden' : (gif ? 'GIF' : (LABELS[fileCat(f)] || 'File'));
-    var labelColor = f.hidden ? '#ec4899' : (gif ? '#10b981' : '#7c3aed');
-    return '<div class="file-item" data-file="' + f.id + '" style="' + rowStyle + '">'
-      + '<div style="' + blur + '">' + thumbHtml(f) + '</div>'
-      + '<div style="flex:1;min-width:0;' + blur + '">'
-      + '<div style="font-weight:600;color:#1f2937;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + (isRevealed ? '[hidden]' : esc(f.name)) + '</div>'
-      + '<div class="text-sm text-gray">' + (isRevealed ? 'hidden' : fmtSize(f.size)) + '</div>'
-      + '<div class="text-sm" style="color:' + labelColor + ';font-weight:500;">' + label + '</div>'
-      + '</div>'
-      + '<div class="flex gap-1">'
-      + '<button class="icon-btn hide-btn" data-id="' + f.id + '" title="' + (f.hidden?'Unhide':'Hide') + '" style="color:' + (f.hidden?'#ec4899':'#9ca3af') + ';">' + (f.hidden?eyeOff:eyeOpen) + '</button>'
-      + (isRevealed ? '' : '<button class="icon-btn pv-open" data-id="' + f.id + '" title="Preview" style="color:#7c3aed;">' + eyeOpen + '</button>')
-      + '<button class="icon-btn dl-btn" data-id="' + f.id + '" title="Download" style="color:#3b82f6;">' + dlSvg + '</button>'
-      + '<button class="icon-btn del-file" data-id="' + f.id + '" title="Delete" style="color:#ef4444;">' + trashSvg + '</button>'
-      + '</div></div>';
+  var fileRows=cFiles.map(function(f){
+    var rev=f.hidden&&S.showHidden;
+    var blur=rev?'filter:blur(6px);pointer-events:none;user-select:none;':'';
+    var rowSt=rev?'opacity:.65;border-color:#f9a8d4;background:#fff1f2;':'';
+    var gif=isGif(f);
+    var label=f.hidden?'Hidden':(gif?'GIF':(LABELS[fileCat(f)]||'File'));
+    var lc=f.hidden?'#ec4899':(gif?'#10b981':'#7c3aed');
+    return '<div class="file-item" data-file="'+f.id+'" style="'+rowSt+'">'
+      +'<div style="'+blur+'">'+thumbHtml(f)+'</div>'
+      +'<div style="flex:1;min-width:0;'+blur+'">'
+      +'<div style="font-weight:600;color:#1f2937;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+(rev?'[hidden]':esc(f.name))+'</div>'
+      +'<div class="text-sm text-gray">'+(rev?'hidden':fmtSize(f.size))+'</div>'
+      +'<div class="text-sm" style="color:'+lc+';font-weight:500;">'+label+'</div></div>'
+      +'<div class="flex gap-1">'
+      +'<button class="icon-btn hide-btn" data-id="'+f.id+'" style="color:'+(f.hidden?'#ec4899':'#9ca3af')+'">'+(f.hidden?eyeOff:eyeOn)+'</button>'
+      +(rev?'':'<button class="icon-btn pv-open" data-id="'+f.id+'" style="color:#7c3aed;">'+eyeOn+'</button>')
+      +'<button class="icon-btn dl-btn" data-id="'+f.id+'" style="color:#3b82f6;">'+dl+'</button>'
+      +'<button class="icon-btn del-file" data-id="'+f.id+'" style="color:#ef4444;">'+trash+'</button>'
+      +'</div></div>';
   }).join('');
 
-  var empty = (cFolders.length === 0 && cFiles.length === 0 && hiddenN === 0)
-    ? '<div style="padding:3rem;text-align:center;color:#9ca3af;">'
-      + '<svg width="64" height="64" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin:0 auto;opacity:.4;display:block;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" stroke-width="2"/></svg>'
-      + '<p style="margin-top:1rem;font-size:1.1rem;">Empty folder</p>'
-      + '<p class="text-sm mt-1">Create a folder or upload files to get started</p></div>'
-    : '';
+  var empty=(cFolders.length===0&&cFiles.length===0&&hiddenN===0)
+    ?'<div style="padding:3rem;text-align:center;color:#9ca3af;">'
+      +'<svg width="64" height="64" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin:0 auto;opacity:.4;display:block;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" stroke-width="2"/></svg>'
+      +'<p style="margin-top:1rem;font-size:1.1rem;">Empty folder</p>'
+      +'<p class="text-sm mt-1">Create a folder or upload files to get started</p></div>':'';
 
-  var vaultLabel = S.showHidden ? 'Lock Secret Vault' : ('Secret Vault' + (hiddenN > 0 ? ' (' + hiddenN + ')' : ''));
-  var vaultStyle = S.showHidden ? 'background:#fdf2f8;color:#db2777;border:1px solid #f9a8d4;' : 'background:#f3f4f6;color:#374151;border:1px solid #e5e7eb;';
+  var vaultLabel=S.showHidden?'Lock Secret Vault':('Secret Vault'+(hiddenN>0?' ('+hiddenN+')':''));
+  var vaultStyle=S.showHidden?'background:#fdf2f8;color:#db2777;border:1px solid #f9a8d4;':'background:#f3f4f6;color:#374151;border:1px solid #e5e7eb;';
 
-  var modal = '';
-  if (S.showModal === 'newFolder') {
-    modal = '<div class="modal"><div class="modal-box">'
-      + '<h2 style="font-size:1.25rem;font-weight:bold;margin-bottom:1rem;">Create New Folder</h2>'
-      + '<input type="text" class="input mb-2" placeholder="Folder name" id="folderNameInput" value="' + esc(S.newFolderName) + '">'
-      + '<div class="flex gap-1">'
-      + '<button class="btn btn-primary" style="flex:1;" id="createFolderBtn">Create</button>'
-      + '<button class="btn" style="flex:1;background:#e5e7eb;color:#1f2937;" id="cancelModalBtn">Cancel</button>'
-      + '</div></div></div>';
-  } else if (S.showModal === 'secret' || S.showModal === 'changeSecret') {
-    modal = renderSecretModal();
+  var uploadInfo=S.uploading
+    ?'<div style="margin-bottom:1rem;padding:.75rem 1rem;background:#f5f3ff;border-radius:.5rem;border:1px solid #ddd6fe;">'
+      +'<div style="font-size:.85rem;color:#7c3aed;font-weight:600;margin-bottom:.4rem;">Uploading... '+S.uploadProgress+'%</div>'
+      +'<div class="progress-bar"><div class="progress-fill" style="width:'+S.uploadProgress+'%"></div></div></div>':'';
+
+  var modal='';
+  if (S.showModal==='newFolder') {
+    modal='<div class="modal"><div class="modal-box">'
+      +'<h2 style="font-size:1.25rem;font-weight:bold;margin-bottom:1rem;">Create New Folder</h2>'
+      +'<input type="text" class="input mb-2" placeholder="Folder name" id="folderNameInput" value="'+esc(S.newFolderName)+'">'
+      +'<div class="flex gap-1"><button class="btn btn-primary" style="flex:1;" id="createFolderBtn">Create</button>'
+      +'<button class="btn" style="flex:1;background:#e5e7eb;color:#1f2937;" id="cancelModalBtn">Cancel</button></div></div></div>';
+  } else if (S.showModal==='secret'||S.showModal==='changeSecret') {
+    modal=renderSecretModal();
   }
 
   return '<div class="header"><div class="container flex" style="align-items:center;justify-content:space-between;">'
-    + '<div class="flex gap-1" style="align-items:center;">'
-    + '<svg width="24" height="24" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1" stroke-width="2"/></svg>'
-    + '<h1 style="font-size:1.25rem;font-weight:bold;">File Locker</h1>'
-    + '<span style="background:rgba(255,255,255,.2);font-size:.72rem;font-weight:600;padding:2px 8px;border-radius:2rem;margin-left:.25rem;">☁️ Synced</span>'
-    + '</div>'
-    + '<button class="btn" style="background:rgba(255,255,255,.2);" id="lockBtn">'
-    + '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" stroke-width="2"/></svg>Lock</button>'
-    + '</div></div>'
-    + '<div class="container" style="margin-top:1rem;">'
-    + (S.error   ? '<div class="alert alert-error">'   + esc(S.error)   + '</div>' : '')
-    + (S.success ? '<div class="alert alert-success">' + esc(S.success) + '</div>' : '')
-    + '<div class="breadcrumb">' + crumb + '</div>'
-    + '<div class="card">'
-    + '<div class="flex gap-1 mb-2" style="flex-wrap:wrap;">'
-    + '<button class="btn btn-primary" id="newFolderBtn">'
-    + '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" stroke-width="2"/><path d="M12 11v6M9 14h6" stroke-width="2"/></svg>New Folder</button>'
-    + '<label class="btn btn-secondary" style="cursor:pointer;">'
-    + '<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke-width="2"/></svg>'
-    + (S.uploading ? 'Uploading...' : 'Upload Files')
-    + '<input type="file" multiple accept="*/*" class="hidden" id="fileInput" ' + (S.uploading?'disabled':'') + '></label>'
-    + '<button class="btn" id="vaultBtn" style="' + vaultStyle + '">'
-    + '<svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke-width="2"/></svg>'
-    + vaultLabel + '</button>'
-    + '</div>'
-    + '<div>' + empty + folderRows + fileRows + '</div>'
-    + '</div></div>' + modal;
+    +'<div class="flex gap-1" style="align-items:center;">'
+    +'<svg width="24" height="24" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1" stroke-width="2"/></svg>'
+    +'<h1 style="font-size:1.25rem;font-weight:bold;">File Locker</h1>'
+    +'<span style="background:rgba(255,255,255,.2);font-size:.72rem;font-weight:600;padding:2px 8px;border-radius:2rem;margin-left:.25rem;">☁️ Synced</span>'
+    +'</div>'
+    +'<button class="btn" style="background:rgba(255,255,255,.2);" id="lockBtn">'
+    +'<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" stroke-width="2"/></svg>Lock</button>'
+    +'</div></div>'
+    +'<div class="container" style="margin-top:1rem;">'
+    +(S.error?'<div class="alert alert-error">'+esc(S.error)+'</div>':'')
+    +(S.success?'<div class="alert alert-success">'+esc(S.success)+'</div>':'')
+    +uploadInfo
+    +'<div class="breadcrumb">'+crumb+'</div>'
+    +'<div class="card">'
+    +'<div class="flex gap-1 mb-2" style="flex-wrap:wrap;">'
+    +'<button class="btn btn-primary" id="newFolderBtn"><svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" stroke-width="2"/><path d="M12 11v6M9 14h6" stroke-width="2"/></svg>New Folder</button>'
+    +'<label class="btn btn-secondary" style="cursor:pointer;"><svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke-width="2"/></svg>'
+    +(S.uploading?'Uploading...':'Upload Files')
+    +'<input type="file" multiple accept="*/*" class="hidden" id="fileInput" '+(S.uploading?'disabled':'')+'></label>'
+    +'<button class="btn" id="vaultBtn" style="'+vaultStyle+'">'
+    +'<svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke-width="2"/></svg>'
+    +vaultLabel+'</button></div>'
+    +'<div>'+empty+folderRows+fileRows+'</div></div></div>'+modal;
 }
 
 // ── Listeners ─────────────────────────────────────────────────────
 function attachListeners() {
-  var Q = function(id) { return document.getElementById(id); };
-  var pwInput = Q('pwInput'), togglePw = Q('togglePw'), loginBtn = Q('loginBtn'), lockBtn = Q('lockBtn');
-  var fileInput = Q('fileInput'), newFolderBtn = Q('newFolderBtn'), folderNameInput = Q('folderNameInput');
-  var createFolderBtn = Q('createFolderBtn'), cancelModalBtn = Q('cancelModalBtn'), vaultBtn = Q('vaultBtn');
-  var setSecretBtn = Q('setSecretBtn'), unlockSecretBtn = Q('unlockSecretBtn'), cancelSecretBtn = Q('cancelSecretBtn');
-  var changeSecretLinkBtn = Q('changeSecretLinkBtn'), confirmChangeBtn = Q('confirmChangeBtn');
+  var Q=function(id){return document.getElementById(id);};
+  var pwInput=Q('pwInput'),togglePw=Q('togglePw'),loginBtn=Q('loginBtn'),lockBtn=Q('lockBtn');
+  var fileInput=Q('fileInput'),newFolderBtn=Q('newFolderBtn'),folderNameInput=Q('folderNameInput');
+  var createFolderBtn=Q('createFolderBtn'),cancelModalBtn=Q('cancelModalBtn'),vaultBtn=Q('vaultBtn');
+  var setSecretBtn=Q('setSecretBtn'),unlockSecretBtn=Q('unlockSecretBtn'),cancelSecretBtn=Q('cancelSecretBtn');
+  var changeSecretLinkBtn=Q('changeSecretLinkBtn'),confirmChangeBtn=Q('confirmChangeBtn');
 
-  if (pwInput) {
-    pwInput.addEventListener('input', function(e) { S.password = e.target.value; });
-    pwInput.addEventListener('keypress', function(e) { if (e.key==='Enter') doLogin(); });
-    setTimeout(function() { pwInput.focus(); }, 80);
-  }
-  if (togglePw) togglePw.addEventListener('click', function() {
-    S.showPassword = !S.showPassword; render();
-    setTimeout(function() { var p=Q('pwInput'); if(p) p.focus(); }, 80);
-  });
-  if (loginBtn) loginBtn.addEventListener('click', doLogin);
-  if (lockBtn)  lockBtn.addEventListener('click', doLock);
-  if (fileInput) fileInput.addEventListener('change', handleUpload);
-  if (newFolderBtn) newFolderBtn.addEventListener('click', function() {
-    S.showModal='newFolder'; S.newFolderName=''; render();
-    setTimeout(function() { var el=Q('folderNameInput'); if(el) el.focus(); }, 80);
-  });
-  if (folderNameInput) {
-    folderNameInput.addEventListener('input', function(e) { S.newFolderName=e.target.value; });
-    folderNameInput.addEventListener('keypress', function(e) { if(e.key==='Enter') doCreateFolder(); });
-  }
-  if (createFolderBtn) createFolderBtn.addEventListener('click', doCreateFolder);
-  if (cancelModalBtn)  cancelModalBtn.addEventListener('click', function() { S.showModal=null; render(); });
-  if (vaultBtn) vaultBtn.addEventListener('click', function() {
-    if (S.showHidden) { S.showHidden=false; render(); }
-    else { S.secretError=''; S.showModal='secret'; render(); setTimeout(function() { var el=Q('secretPwA'); if(el) el.focus(); }, 80); }
-  });
-  if (setSecretBtn) setSecretBtn.addEventListener('click', doSetSecret);
-  if (unlockSecretBtn) unlockSecretBtn.addEventListener('click', doUnlockSecret);
-  if (cancelSecretBtn) cancelSecretBtn.addEventListener('click', function() { S.showModal=null; S.secretError=''; render(); });
-  if (changeSecretLinkBtn) changeSecretLinkBtn.addEventListener('click', function() {
-    S.showModal='changeSecret'; S.secretError=''; render();
-    setTimeout(function() { var el=Q('oldSecretInput'); if(el) el.focus(); }, 80);
-  });
-  if (confirmChangeBtn) confirmChangeBtn.addEventListener('click', doChangeSecret);
+  if (pwInput) { pwInput.addEventListener('input',function(e){S.password=e.target.value;}); pwInput.addEventListener('keypress',function(e){if(e.key==='Enter')doLogin();}); setTimeout(function(){pwInput.focus();},80); }
+  if (togglePw) togglePw.addEventListener('click',function(){S.showPassword=!S.showPassword;render();setTimeout(function(){var p=Q('pwInput');if(p)p.focus();},80);});
+  if (loginBtn) loginBtn.addEventListener('click',doLogin);
+  if (lockBtn) lockBtn.addEventListener('click',doLock);
+  if (fileInput) fileInput.addEventListener('change',handleUpload);
+  if (newFolderBtn) newFolderBtn.addEventListener('click',function(){S.showModal='newFolder';S.newFolderName='';render();setTimeout(function(){var el=Q('folderNameInput');if(el)el.focus();},80);});
+  if (folderNameInput) { folderNameInput.addEventListener('input',function(e){S.newFolderName=e.target.value;}); folderNameInput.addEventListener('keypress',function(e){if(e.key==='Enter')doCreateFolder();}); }
+  if (createFolderBtn) createFolderBtn.addEventListener('click',doCreateFolder);
+  if (cancelModalBtn) cancelModalBtn.addEventListener('click',function(){S.showModal=null;render();});
+  if (vaultBtn) vaultBtn.addEventListener('click',function(){if(S.showHidden){S.showHidden=false;render();}else{S.secretError='';S.showModal='secret';render();setTimeout(function(){var el=Q('secretPwA');if(el)el.focus();},80);}});
+  if (setSecretBtn) setSecretBtn.addEventListener('click',doSetSecret);
+  if (unlockSecretBtn) unlockSecretBtn.addEventListener('click',doUnlockSecret);
+  if (cancelSecretBtn) cancelSecretBtn.addEventListener('click',function(){S.showModal=null;S.secretError='';render();});
+  if (changeSecretLinkBtn) changeSecretLinkBtn.addEventListener('click',function(){S.showModal='changeSecret';S.secretError='';render();setTimeout(function(){var el=Q('oldSecretInput');if(el)el.focus();},80);});
+  if (confirmChangeBtn) confirmChangeBtn.addEventListener('click',doChangeSecret);
 
-  var onEnter = function(fn) { return function(e) { if(e.key==='Enter') fn(); }; };
-  var spwA=Q('secretPwA'), spwB=Q('secretPwB');
-  if (spwA) spwA.addEventListener('keypress', onEnter(S.secretPassword ? doUnlockSecret : doSetSecret));
-  if (spwB) spwB.addEventListener('keypress', onEnter(doSetSecret));
-  var oldSec=Q('oldSecretInput'), newSec=Q('newSecretInput'), confSec=Q('confirmSecretInput');
-  if (oldSec)  oldSec.addEventListener('keypress',  onEnter(doChangeSecret));
-  if (newSec)  newSec.addEventListener('keypress',  onEnter(doChangeSecret));
-  if (confSec) confSec.addEventListener('keypress', onEnter(doChangeSecret));
+  var onEnter=function(fn){return function(e){if(e.key==='Enter')fn();};};
+  var spwA=Q('secretPwA'),spwB=Q('secretPwB');
+  if(spwA)spwA.addEventListener('keypress',onEnter(S.secretPassword?doUnlockSecret:doSetSecret));
+  if(spwB)spwB.addEventListener('keypress',onEnter(doSetSecret));
+  var os=Q('oldSecretInput'),ns=Q('newSecretInput'),cs=Q('confirmSecretInput');
+  if(os)os.addEventListener('keypress',onEnter(doChangeSecret));
+  if(ns)ns.addEventListener('keypress',onEnter(doChangeSecret));
+  if(cs)cs.addEventListener('keypress',onEnter(doChangeSecret));
 
-  document.querySelectorAll('.bc-item').forEach(function(el) {
-    el.addEventListener('click', function() {
-      var i=parseInt(el.dataset.idx);
-      S.currentPath = i===-1 ? [] : S.currentPath.slice(0, i+1);
-      S.error=''; S.success=''; render();
-    });
-  });
-  document.querySelectorAll('.folder-item').forEach(function(el) {
-    el.addEventListener('click', function(e) {
-      if (e.target.closest('.del-folder')) return;
-      var f=S.folders.find(function(f) { return String(f.id)===String(el.dataset.fid); });
-      if (f) { S.currentPath.push(f); S.error=''; S.success=''; render(); }
-    });
-  });
-  document.querySelectorAll('.file-item').forEach(function(el) {
-    el.addEventListener('click', function(e) {
-      if (e.target.closest('.pv-open')||e.target.closest('.dl-btn')||e.target.closest('.del-file')||e.target.closest('.hide-btn')) return;
-      var f=S.files.find(function(f) { return String(f.id)===String(el.dataset.file); });
-      if (!f||f.hidden) return;
-      openPreview(el.dataset.file);
-    });
-  });
-  document.querySelectorAll('.pv-open').forEach(function(b) {
-    b.addEventListener('click', function(e) { e.stopPropagation(); openPreview(b.dataset.id); });
-  });
-  document.querySelectorAll('.dl-btn').forEach(function(b) {
-    b.addEventListener('click', function(e) {
-      e.stopPropagation();
-      var f=S.files.find(function(f) { return String(f.id)===String(b.dataset.id); });
-      if (f) dlFile(f);
-    });
-  });
-  document.querySelectorAll('.hide-btn').forEach(function(b) {
-    b.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      var f=S.files.find(function(f) { return String(f.id)===String(b.dataset.id); });
-      if (!f) return;
-      f.hidden=!f.hidden;
-      await saveFile(f); render();
-    });
-  });
-  document.querySelectorAll('.del-file').forEach(function(b) {
-    b.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      if (!confirm('Delete this file?')) return;
-      var id=b.dataset.id;
-      S.files=S.files.filter(function(f) { return String(f.id)!==String(id); });
-      await deleteFile(id); flash('File deleted');
-    });
-  });
-  document.querySelectorAll('.del-folder').forEach(function(b) {
-    b.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      if (!confirm('Delete this folder and all its contents?')) return;
-      await doDelFolder(b.dataset.id);
-      flash('Folder deleted');
-    });
-  });
+  document.querySelectorAll('.bc-item').forEach(function(el){el.addEventListener('click',function(){var i=parseInt(el.dataset.idx);S.currentPath=i===-1?[]:S.currentPath.slice(0,i+1);S.error='';S.success='';render();});});
+  document.querySelectorAll('.folder-item').forEach(function(el){el.addEventListener('click',function(e){if(e.target.closest('.del-folder'))return;var f=S.folders.find(function(f){return String(f.id)===String(el.dataset.fid);});if(f){S.currentPath.push(f);S.error='';S.success='';render();}});});
+  document.querySelectorAll('.file-item').forEach(function(el){el.addEventListener('click',function(e){if(e.target.closest('.pv-open')||e.target.closest('.dl-btn')||e.target.closest('.del-file')||e.target.closest('.hide-btn'))return;var f=S.files.find(function(f){return String(f.id)===String(el.dataset.file);});if(!f||f.hidden)return;openPreview(el.dataset.file);});});
+  document.querySelectorAll('.pv-open').forEach(function(b){b.addEventListener('click',function(e){e.stopPropagation();openPreview(b.dataset.id);});});
+  document.querySelectorAll('.dl-btn').forEach(function(b){b.addEventListener('click',async function(e){e.stopPropagation();var f=S.files.find(function(f){return String(f.id)===String(b.dataset.id);});if(!f)return;if(!f.dataUrl&&f.chunks>0){showSync('syncing','Loading...');f.dataUrl=await loadFileData(f.id,f.chunks);showSync('synced','Ready!');}dlFile(f);});});
+  document.querySelectorAll('.hide-btn').forEach(function(b){b.addEventListener('click',async function(e){e.stopPropagation();var f=S.files.find(function(f){return String(f.id)===String(b.dataset.id);});if(!f)return;f.hidden=!f.hidden;await saveMeta(f);showSync('synced','Synced!');render();});});
+  document.querySelectorAll('.del-file').forEach(function(b){b.addEventListener('click',async function(e){e.stopPropagation();if(!confirm('Delete this file?'))return;var f=S.files.find(function(f){return String(f.id)===String(b.dataset.id);});if(!f)return;S.files=S.files.filter(function(x){return String(x.id)!==String(f.id);});showSync('syncing','Deleting...');await deleteFileFromDB(f);showSync('synced','Deleted!');flash('File deleted');});});
+  document.querySelectorAll('.del-folder').forEach(function(b){b.addEventListener('click',async function(e){e.stopPropagation();if(!confirm('Delete this folder and all its contents?'))return;await doDelFolder(b.dataset.id);flash('Folder deleted');});});
 }
 
 // ── Actions ───────────────────────────────────────────────────────
 async function doLogin() {
-  if (!S.password.trim()) { S.error='Please enter a password'; render(); return; }
-  if (!S.storedPassword) {
-    S.storedPassword=S.password;
-    await saveSettings();
-    S.isLocked=false; S.password=''; S.error=''; startRealtimeSync(); render();
-  } else if (S.password===S.storedPassword) {
-    S.isLocked=false; S.password=''; S.error=''; startRealtimeSync(); render();
-  } else {
-    S.error='Incorrect password'; S.password=''; render();
-  }
+  if (!S.password.trim()){S.error='Please enter a password';render();return;}
+  if (!S.storedPassword){S.storedPassword=S.password;await saveSettings();S.isLocked=false;S.password='';S.error='';startRealtimeSync();render();}
+  else if (S.password===S.storedPassword){S.isLocked=false;S.password='';S.error='';startRealtimeSync();render();}
+  else{S.error='Incorrect password';S.password='';render();}
 }
 
 function doLock() {
-  if (S.syncUnsubscribe) { S.syncUnsubscribe(); S.syncUnsubscribe=null; }
-  S.isLocked=true; S.password=''; S.error=''; S.success='';
-  S.currentPath=[]; S.showHidden=false; closePv(); render();
+  if(S.unsub){S.unsub();S.unsub=null;}
+  S.isLocked=true;S.password='';S.error='';S.success='';S.currentPath=[];S.showHidden=false;closePv();render();
 }
 
 async function doCreateFolder() {
-  if (!S.newFolderName.trim()) { S.error='Please enter a folder name'; render(); return; }
-  var pid=S.currentPath.length ? S.currentPath[S.currentPath.length-1].id : null;
-  var folder={ id:Date.now()+Math.random(), name:S.newFolderName.trim(), parentId:pid, created:new Date().toISOString() };
-  S.folders.push(folder);
-  await saveFolder(folder);
-  S.showModal=null; S.newFolderName=''; flash('Folder created');
+  if(!S.newFolderName.trim()){S.error='Please enter a folder name';render();return;}
+  var pid=S.currentPath.length?S.currentPath[S.currentPath.length-1].id:null;
+  var folder={id:String(Date.now()),name:S.newFolderName.trim(),parentId:pid,created:new Date().toISOString()};
+  S.folders.push(folder);await saveFolder(folder);S.showModal=null;S.newFolderName='';flash('Folder created');
 }
 
 async function doDelFolder(fid) {
-  var childFiles=S.files.filter(function(f) { return String(f.folderId)===String(fid); });
-  for (var i=0;i<childFiles.length;i++) await deleteFile(childFiles[i].id);
-  S.files=S.files.filter(function(f) { return String(f.folderId)!==String(fid); });
-  var childFolders=S.folders.filter(function(f) { return String(f.parentId)===String(fid); });
-  for (var j=0;j<childFolders.length;j++) await doDelFolder(childFolders[j].id);
-  S.folders=S.folders.filter(function(f) { return String(f.id)!==String(fid); });
-  await deleteFolder(fid);
-  render();
+  var cf=S.files.filter(function(f){return String(f.folderId)===String(fid);});
+  for(var i=0;i<cf.length;i++) await deleteFileFromDB(cf[i]);
+  S.files=S.files.filter(function(f){return String(f.folderId)!==String(fid);});
+  var sf=S.folders.filter(function(f){return String(f.parentId)===String(fid);});
+  for(var j=0;j<sf.length;j++) await doDelFolder(sf[j].id);
+  S.folders=S.folders.filter(function(f){return String(f.id)!==String(fid);});
+  await deleteFolderFromDB(fid);render();
 }
 
-async function doSetSecret() {
-  var a=(document.getElementById('secretPwA')||{}).value||'';
-  var b=(document.getElementById('secretPwB')||{}).value||'';
-  if (!a.trim()) { S.secretError='Please enter a password'; render(); return; }
-  if (a!==b)     { S.secretError='Passwords do not match'; render(); return; }
-  S.secretPassword=a;
-  await saveSettings();
-  S.showHidden=true; S.showModal=null; S.secretError=''; flash('Secret vault created and unlocked');
-}
-
-async function doUnlockSecret() {
-  var val=(document.getElementById('secretPwA')||{}).value||'';
-  if (val===S.secretPassword) { S.showHidden=true; S.showModal=null; S.secretError=''; render(); }
-  else { S.secretError='Wrong password, try again'; render(); setTimeout(function() { var el=document.getElementById('secretPwA'); if(el){el.value='';el.focus();} }, 50); }
-}
-
-async function doChangeSecret() {
-  var o=(document.getElementById('oldSecretInput')||{}).value||'';
-  var n=(document.getElementById('newSecretInput')||{}).value||'';
-  var c=(document.getElementById('confirmSecretInput')||{}).value||'';
-  if (o!==S.secretPassword) { S.secretError='Current password is incorrect'; render(); return; }
-  if (!n.trim())             { S.secretError='New password cannot be empty'; render(); return; }
-  if (n!==c)                 { S.secretError='New passwords do not match'; render(); return; }
-  S.secretPassword=n;
-  await saveSettings();
-  S.showModal=null; S.secretError=''; flash('Secret password updated');
-}
+async function doSetSecret(){var a=(document.getElementById('secretPwA')||{}).value||'',b=(document.getElementById('secretPwB')||{}).value||'';if(!a.trim()){S.secretError='Please enter a password';render();return;}if(a!==b){S.secretError='Passwords do not match';render();return;}S.secretPassword=a;await saveSettings();S.showHidden=true;S.showModal=null;S.secretError='';flash('Secret vault created and unlocked');}
+async function doUnlockSecret(){var val=(document.getElementById('secretPwA')||{}).value||'';if(val===S.secretPassword){S.showHidden=true;S.showModal=null;S.secretError='';render();}else{S.secretError='Wrong password, try again';render();setTimeout(function(){var el=document.getElementById('secretPwA');if(el){el.value='';el.focus();}},50);}}
+async function doChangeSecret(){var o=(document.getElementById('oldSecretInput')||{}).value||'',n=(document.getElementById('newSecretInput')||{}).value||'',c=(document.getElementById('confirmSecretInput')||{}).value||'';if(o!==S.secretPassword){S.secretError='Current password is incorrect';render();return;}if(!n.trim()){S.secretError='New password cannot be empty';render();return;}if(n!==c){S.secretError='New passwords do not match';render();return;}S.secretPassword=n;await saveSettings();S.showModal=null;S.secretError='';flash('Secret password updated');}
 
 async function handleUpload(e) {
-  S.uploading=true; S.error=''; render();
-  var fid=S.currentPath.length ? S.currentPath[S.currentPath.length-1].id : null;
+  S.uploading=true;S.uploadProgress=0;S.error='';render();
+  var fid=S.currentPath.length?S.currentPath[S.currentPath.length-1].id:null;
   var files=Array.from(e.target.files);
-  for (var i=0;i<files.length;i++) {
+  for(var i=0;i<files.length;i++){
     var file=files[i];
-    try {
+    try{
       var gif=isGif(file);
-      var img=gif||file.type.startsWith('image/');
-      var data=(img&&!gif) ? await compressImage(file) : await readDataURL(file);
       var type=file.type||(gif?'image/gif':'application/octet-stream');
-      var newFile={ id:Date.now()+Math.random(), name:file.name, size:file.size, type:type, data:data, date:new Date().toISOString(), folderId:fid, hidden:false };
+      var dataUrl=(!gif&&file.type.startsWith('image/'))?await compressImage(file):await readDataURL(file);
+      var newFile={id:String(Date.now()),name:file.name,size:file.size,type:type,date:new Date().toISOString(),folderId:fid,hidden:false,dataUrl:dataUrl,chunks:0};
+      await saveFileChunked(newFile,dataUrl);
       S.files.push(newFile);
-      await saveFile(newFile);
-    } catch(err) { S.error='Failed to upload '+file.name; }
+      render();
+    }catch(err){console.error(err);S.error='Failed to upload '+file.name;}
   }
-  S.uploading=false; e.target.value=''; flash(files.length+' file(s) uploaded');
+  S.uploading=false;S.uploadProgress=0;e.target.value='';flash(files.length+' file(s) uploaded');
 }
 
-// ── Utils ─────────────────────────────────────────────────────────
-function flash(msg) { S.success=msg; render(); setTimeout(function() { S.success=''; render(); }, 3000); }
-function dlFile(file) { var a=document.createElement('a'); a.href=file.data; a.download=file.name; a.click(); }
-function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function fmtSize(b) { if(!b) return '0 B'; if(b<1024) return b+' B'; if(b<1048576) return (b/1024).toFixed(1)+' KB'; return (b/1048576).toFixed(1)+' MB'; }
-function fCount(fid) {
-  var n=S.files.filter(function(f) { return f.folderId===fid; }).length;
-  S.folders.filter(function(f) { return f.parentId===fid; }).forEach(function(s) { n+=fCount(s.id); });
-  return n;
-}
+function flash(msg){S.success=msg;render();setTimeout(function(){S.success='';render();},3000);}
+function dlFile(file){var a=document.createElement('a');a.href=file.dataUrl;a.download=file.name;a.click();}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function fmtSize(b){if(!b)return '0 B';if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';return (b/1048576).toFixed(1)+' MB';}
+function fCount(fid){var n=S.files.filter(function(f){return f.folderId===fid;}).length;S.folders.filter(function(f){return f.parentId===fid;}).forEach(function(s){n+=fCount(s.id);});return n;}
 
-function compressImage(file) {
-  return new Promise(function(res) {
-    var r=new FileReader();
-    r.onload=function(ev) {
-      var img=new Image();
-      img.onload=function() {
-        var W=1200, w=img.width, h=img.height;
-        if (w>W) { h=h*W/w; w=W; }
-        var c=document.createElement('canvas'); c.width=w; c.height=h;
-        c.getContext('2d').drawImage(img,0,0,w,h);
-        c.toBlob(function(blob) { var r2=new FileReader(); r2.onloadend=function() { res(r2.result); }; r2.readAsDataURL(blob); },'image/jpeg',0.75);
-      };
-      img.src=ev.target.result;
-    };
-    r.readAsDataURL(file);
-  });
-}
+function compressImage(file){return new Promise(function(res){var r=new FileReader();r.onload=function(ev){var img=new Image();img.onload=function(){var W=1200,w=img.width,h=img.height;if(w>W){h=h*W/w;w=W;}var c=document.createElement('canvas');c.width=w;c.height=h;c.getContext('2d').drawImage(img,0,0,w,h);c.toBlob(function(blob){var r2=new FileReader();r2.onloadend=function(){res(r2.result);};r2.readAsDataURL(blob);},'image/jpeg',0.75);};img.src=ev.target.result;};r.readAsDataURL(file);});}
+function readDataURL(file){return new Promise(function(res){var r=new FileReader();r.onload=function(e){res(e.target.result);};r.readAsDataURL(file);});}
 
-function readDataURL(file) {
-  return new Promise(function(res) {
-    var r=new FileReader();
-    r.onload=function(e) { res(e.target.result); };
-    r.readAsDataURL(file);
-  });
-}
-
-// ── Boot ──────────────────────────────────────────────────────────
-(async function() {
-  showSync('syncing', 'Connecting...');
-  try {
-    await loadSettings();
-    showSync('synced', 'Connected!');
-  } catch(e) {
-    showSync('offline', 'Offline');
-  }
+(async function(){
+  showSync('syncing','Connecting...');
+  try{await loadSettings();showSync('synced','Connected!');}
+  catch(e){showSync('error','Connection failed');}
   render();
 })();
 </script>
